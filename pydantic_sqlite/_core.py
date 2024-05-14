@@ -7,12 +7,12 @@ import sqlite3
 import tempfile
 import typing
 from shutil import copyfile
-from typing import Any, Generator, List, Literal, Union, get_origin
+from typing import Any, Dict, Generator, List, Literal, Union, get_origin
 
 from pydantic import BaseModel
 from pydantic._internal._model_construction import ModelMetaclass
 from pydantic.fields import FieldInfo
-from sqlite_utils import Database as _Database
+from sqlite_utils import Database as _SqliteDatabase
 
 from ._misc import convert_value_into_union_types
 
@@ -22,31 +22,37 @@ SPECIALTYPE = [
     Union]
 
 
-class TableBaseModel:
+class TableMetaInfo:
+    """
+    This class is a bucket which containes the meta informations about a table in a sqlite Database.
 
-    def __init__(self, table: str, basemodel_cls: ModelMetaclass, pks: List[str]) -> None:
-        self.table = table
-        self.basemodel_cls = basemodel_cls
-        self.modulename = str(basemodel_cls).split("<class '")[1].split("'>")[0]
-        self.pks = pks
+    Attributes:
+        tablename `str`: The name of the table.
+        model_class `ModelMetaclass`: The BaseModel class which will be used to initalize with a table entry.
+        modulename: `str`: The name of the module which containes the model_class.
+        classname: `str`: The correct name of the class.
+        pks: `list[str]`: the primary key in the table.
 
-    def data(self):
-        return dict(
-            table=self.table,
-            modulename=self.modulename,
-            pks=self.pks)
+    """
+    def __init__(self, tablename: str, model_class: ModelMetaclass, pks: List[str]) -> None:
+        self.tablename = tablename
+        self.model_class = model_class
+        self.modulename = self.model_class.__module__         # Get the module name
+        self.classname = self.model_class.__name__              # Get the class name
+        self.pks = pks  # TODO warum eine Liste??
 
 
-class DataBase():
+class DataBase:
+    known_models: Dict[str, TableMetaInfo]
 
     def __init__(self, **kwargs):
-        self._basemodels = {}
-        self._db = _Database(memory=True)
+        self.known_models = dict()
+        self._db = _SqliteDatabase(memory=True)
 
     def __call__(self, tablename) -> Generator[BaseModel, None, None]:
         """returns a Generator for all values in the Table. The returned values are subclasses of pydantic.BaseModel"""
         try:
-            basemodel = self._basemodels[tablename]
+            basemodel = self.known_models[tablename]
             foreign_refs = {key.column: key.other_table for key in self._db[tablename].foreign_keys}
         except KeyError:
             raise KeyError(f"can not find Table: {tablename} in Database") from None
@@ -62,14 +68,14 @@ class DataBase():
             pk: str = "uuid") -> None:
         """adds a new value to the table tablename"""
 
-        # unkown Tablename -> means new Table -> update the table_basemodel_ref list
-        if tablename not in self._basemodels:
-            self._basemodels_add_model(table=tablename, basemodel_cls=type(value), pks=[pk])
+        # unkown Tablename -> means new Table -> update the table basemodel ref list known_models
+        if tablename not in self.known_models:
+            self._add_model_to_known_models(tablename=tablename, model_class=value.__class__, pks=[pk])
 
         # check whether the value matches the basemodels in the table
         if not isinstance(value, BaseModel):
             msg = f"Can not add type '{type(value)}' to the table '{tablename}',"
-            msg += f" which contains values of type '{self._basemodels[tablename].basemodel_cls}'"
+            msg += f" which contains values of type '{self.known_models[tablename].basemodel_cls}'"
             raise ValueError(msg)
 
         # create dict for writing to the Table
@@ -146,7 +152,7 @@ class DataBase():
         if len(hits) > 1:
             raise Exception("uuid is two times in table")  # TODO choice correct exceptiontype
 
-        model = self._basemodels[tablename]
+        model = self.known_models[tablename]
         foreign_refs = {key.column: key.other_table for key in self._db[tablename].foreign_keys}
         return None if not hits else self._build_basemodel_from_dict(model, hits[0], foreign_refs=foreign_refs)
 
@@ -163,14 +169,11 @@ class DataBase():
         self._db.conn.executescript(query)
         file_db.close()
 
-        for model in self._db["__basemodels__"].rows:
-            classname = model['modulename'].split('.')[-1]
-            modulename = '.'.join(model['modulename'].split('.')[:-1])
-            my_module = importlib.import_module(modulename)
-            self._basemodels_add_model(
-                table=model['table'],
-                basemodel_cls=getattr(my_module, classname),
-                pks=json.loads(model['pks']))
+        for row in self._db["__basemodels__"].rows:
+            self._add_model_to_known_models(
+                tablename=row['tablename'],
+                model_class=getattr(importlib.import_module(row['modulename']), row['classname']),
+                pks=json.loads(row['pks']))
 
     def save(self, filename: str) -> None:
         """saves alle values from the in_memory database to a file"""
@@ -194,16 +197,22 @@ class DataBase():
             logging.warning(f"saved the backup file under '{backup}'")
             raise
 
-    def _basemodels_add_model(self, **kwargs):
-        model = TableBaseModel(**kwargs)
-        self._basemodels.update({kwargs['table']: model})
-        self._db["__basemodels__"].upsert(model.data(), pk="modulename")
+    def _add_model_to_known_models(self, tablename: str, model_class: ModelMetaclass, pks: List[str]):
+        new_model = TableMetaInfo(tablename, model_class, pks)
 
-    def _build_basemodel_from_dict(self, tablemodel: TableBaseModel, row: dict, foreign_refs: dict):
+        self.known_models[new_model.tablename] = new_model
+        self._db["__basemodels__"].upsert(
+            dict(
+                tablename=new_model.tablename,
+                modulename=new_model.modulename,
+                classname=new_model.classname,
+                pks=new_model.pks),
+            pk="tablename")
+
+    def _build_basemodel_from_dict(self, tablemeta: TableMetaInfo, row: dict, foreign_refs: dict):
         # returns a subclass object of type BaseModel which is build out of
         # class basemodel.basemodel_cls and the data out of the dict
-        field_models: dict[str, FieldInfo] = tablemodel.basemodel_cls.model_fields
-        tablemodel.basemodel_cls
+        field_models: dict[str, FieldInfo] = tablemeta.model_class.model_fields
         d = {}
 
         for field_name, field_value in row.items():
@@ -223,7 +232,7 @@ class DataBase():
                     data = field_value
 
             d.update({field_name: data})
-        return tablemodel.basemodel_cls(**d)
+        return tablemeta.model_class(**d)
 
     def _upsert_value_in_foreign_table(
             self,
